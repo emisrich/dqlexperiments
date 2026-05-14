@@ -1,0 +1,4 @@
+fetch dt.entity.host
+| fields hostname = entity.name, osType, osVersion
+| summarize { count = count() }, by: {osVersion}
+|sort count desc

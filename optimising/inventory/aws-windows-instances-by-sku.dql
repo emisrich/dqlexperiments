@@ -1,0 +1,11 @@
+fetch dt.entity.host
+| filter osType == "WINDOWS"
+| fieldsAdd ec2 = runs_on[dt.entity.ec2_instance]
+| lookup [
+      fetch dt.entity.ec2_instance
+      | fields id, awsInstanceType
+], sourceField:ec2, lookupField:id, prefix:"ec2"
+| fields hostname = entity.name, osType, instanceType = ec2awsInstanceType
+| filter isNotNull(instanceType)
+| summarize { count = count() }, by: {instanceType}
+|sort count desc
