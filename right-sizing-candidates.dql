@@ -1,0 +1,254 @@
+//
+// ==========================================
+// EC2 + EBS RIGHT-SIZING MODULE (DQL)
+// ==========================================
+//
+// PURPOSE:
+// - Identify EC2 over/under provisioning
+// - Detect disk (EBS) bottlenecks
+// - Recommend EC2 & EBS optimisations
+//
+// MODEL APPROACH:
+// - CPU + Memory baseline (P50) + peak (P95)
+// - Burst detection (P95 - P50)
+// - Disk aggregated across all attached volumes
+// - AWS-aware thresholds (IOPS / throughput)
+//
+// ==========================================
+// STEP 1 — ENTITY SELECTION
+//
+fetch dt.entity.host
+| filter cloudType == "EC2"
+| fields
+    id,
+    hostName = entity.name,
+    osType,
+    cloudType,
+    physicalMemory
+
+
+//
+// ==========================================
+// STEP 2 — METRIC COLLECTION (TIMESERIES)
+// ==========================================
+//
+| lookup [
+    timeseries {
+
+        // ---- CPU ----
+        { Max(dt.host.cpu.usage), alias: cpu_ts },
+
+        // ---- MEMORY ----
+        { Max(dt.host.memory.usage), alias: mem_ts },
+
+        // ---- DISK (ALL VOLUMES AGGREGATED LATER) ----
+        { Max(dt.host.disk.avail), alias: disk_avail_ts },
+        { Max(dt.host.disk.bytes_read), alias: disk_read_ts },
+        { Max(dt.host.disk.bytes_written), alias: disk_write_ts },
+        { Max(dt.host.disk.iops.read), alias: disk_iops_read_ts },
+        { Max(dt.host.disk.iops.write), alias: disk_iops_write_ts },
+
+        // ---- NETWORK ----
+        { Max(dt.host.net.nic.bytes_rx), alias: rx_ts },
+        { Max(dt.host.net.nic.bytes_tx), alias: tx_ts }
+    },
+    by:{dt.entity.host},
+    from: toTimestamp($dt_timeframe_from),
+    to:   toTimestamp($dt_timeframe_to),
+    union:true
+
+
+//
+// ==========================================
+// STEP 3 — CORE METRIC DERIVATION
+// ==========================================
+//
+| fieldsAdd
+
+    // ---- CPU & MEMORY BASELINE vs PEAK ----
+    cpu_50    = round(arrayPercentile(cpu_ts,50), decimals: 2),
+    cpu_95    = round(arrayPercentile(cpu_ts,95), decimals: 2),
+    mem_50    = round(arrayPercentile(mem_ts,50), decimals: 2),
+    mem_95    = round(arrayPercentile(mem_ts,95), decimals: 2)
+| fieldsAdd
+    // ---- VARIABILITY (BURSTINESS) ----
+    cpu_var = cpu_95 - cpu_50,
+    mem_var = mem_95 - mem_50,
+
+    // ---- HEADROOM ----
+    cpu_headroom = 100 - cpu_95,
+    mem_headroom = 100 - mem_95,
+
+    // ---- DISK (MULTI-VOLUME CORRECT HANDLING) ----
+    // sum = total host demand
+    // max = hottest individual disk
+    disk_throughput_sum =
+        arraySum(disk_read_ts) + arraySum(disk_write_ts),
+
+    disk_throughput_max =
+        arrayMax(disk_read_ts) + arrayMax(disk_write_ts)
+
+| fieldsAdd        
+
+    // convert to MB/s for AWS-relevant thresholds
+    disk_throughput_mbps = disk_throughput_sum / 1048576,
+
+    // ---- ESTIMATED IOPS (16KB assumption) ----
+    disk_iops_estimated =
+        (arrayMax(disk_read_ts) + arrayMax(disk_write_ts)) / 16384,
+
+    // ---- NETWORK ----
+    net_bps_max =
+        (arrayMax(rx_ts) + arrayMax(tx_ts)) * 8
+
+
+//
+// ==========================================
+// STEP 4 — WORKLOAD & CONSTRAINT CLASSIFICATION
+// ==========================================
+//
+| fieldsAdd
+
+    // ---- BURSTY vs STEADY ----
+    workload_type =
+        if(cpu_var > 30 OR mem_var > 30,
+            then: "BURSTY",
+            else: "STEADY"
+        ),
+
+    // ---- PRIMARY CONSTRAINT ----
+    resource_constraint =
+        if(cpu_95 > 85,
+            then: "CPU",
+        else: if(mem_95 > 90,
+            then: "MEMORY",
+        else: if(disk_throughput_mbps > 800,
+            then: "DISK",
+            else: "BALANCED"
+        ))),
+
+    // ---- DISK BEHAVIOUR TYPE ----
+    disk_pattern =
+        if(disk_iops_estimated > 5000 AND disk_throughput_mbps < 200,
+            then: "IOPS_INTENSIVE",
+        else: if(disk_throughput_mbps > 400,
+            then: "THROUGHPUT_INTENSIVE",
+            else: "BALANCED"
+        ))
+
+| fieldsAdd
+//
+// ==========================================
+// STEP 5 — EC2 RIGHT-SIZING DECISION ENGINE
+// ==========================================
+//
+    ec2_recommendation =
+        if(cpu_95 > 85 OR mem_95 > 90 OR disk_throughput_mbps > 800,
+            then:
+                if(resource_constraint == "CPU",
+                    then: "Upsize compute (c-family)",
+                else: if(resource_constraint == "MEMORY",
+                    then: "Upsize memory (r-family)",
+                else:
+                    "Review instance I/O limits or upscale (m-family)"
+                )),
+        else:
+            if(cpu_50 < 20 AND mem_50 < 30 AND disk_throughput_mbps < 100,
+                then:
+                    if(resource_constraint == "CPU",
+                        then: "Downsize compute (c-family)",
+                    else: if(resource_constraint == "MEMORY",
+                        then: "Downsize memory (r-family)",
+                        else: "Downsize general (m-family)"
+                    )),
+                else: "Instance suitable"
+            ))
+
+//
+// ==========================================
+// STEP 6 — EBS RIGHT-SIZING DECISION ENGINE
+// ==========================================
+//
+|fieldsAdd
+    ebs_recommendation =
+        if(disk_pattern == "IOPS_INTENSIVE",
+            then: "Use gp3/io2 with higher IOPS",
+        else: if(disk_pattern == "THROUGHPUT_INTENSIVE",
+            then: "Increase EBS throughput (gp3 or larger volume)",
+        else: if(disk_throughput_mbps < 100 AND disk_iops_estimated < 500,
+            then: "Possible EBS cost reduction",
+            else: "EBS configuration appropriate"
+        ))),
+
+
+//
+// ==========================================
+// STEP 7 — INSTANCE EBS LIMIT DETECTION
+// ==========================================
+//
+    ebs_instance_limit_flag =
+        if(disk_throughput_max > 500000000 AND cpu_50 < 40,
+            then: "Likely hitting EC2 EBS bandwidth limit",
+            else: "OK"
+        ),
+
+
+//
+// ==========================================
+// STEP 8 — FINAL CLASSIFICATION (RIGHT-SIZING)
+// ==========================================
+//
+    rightsizing =
+        if(cpu_95 > 85 OR mem_95 > 90 OR disk_throughput_mbps > 800,
+            then: "UNDER-PROVISIONED",
+        else: if(cpu_50 < 20 AND mem_50 < 30 AND disk_throughput_mbps < 100,
+            then: "OVER-PROVISIONED",
+        else:
+            "RIGHT-SIZED"
+        ))
+
+//
+// ==========================================
+// STEP 9 — CONSOLIDATED RECOMMENDATION
+// ==========================================
+//
+| fieldsAdd
+    recommendation_summary =
+        if(cpu_95 > 85 OR mem_95 > 90 OR disk_throughput_mbps > 800,
+            then: ec2_recommendation,
+        else: if(cpu_50 < 20 AND mem_50 < 30,
+            then: ec2_recommendation,
+        else: if(disk_throughput_mbps > 800,
+            then: ebs_recommendation,
+            else: "No action required"
+        )))
+
+], sourceField:id, lookupField:dt.entity.host, prefix:"metric_"
+
+
+
+//
+// ==========================================
+// STEP 10 — FILTER + OUTPUT
+// ==========================================
+//
+| filter metric_rightsizing != "RIGHT-SIZED"
+
+| fields
+    hostName,
+    metric_rightsizing,
+    metric_resource_constraint,
+    metric_workload_type,
+    metric_ec2_recommendation,
+    metric_ebs_recommendation,
+    metric_ebs_instance_limit_flag,
+    metric_recommendation_summary,
+
+    metric_cpu_95,
+    metric_mem_95,
+    metric_cpu_headroom,
+
+    metric_disk_throughput_mbps,
+    metric_disk_iops_estimated
+
+| sort metric_recommendation_summary
