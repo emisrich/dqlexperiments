@@ -1,2 +1,2 @@
 # DQL Experiments
-This is a repo to house some of my experimentations with Dynatrace Query Language (DQL).  I claim no significant expertis: all outputs have been largely the result of experimentation (aka trial and error).
+This is a repo to house some of my experimentations with Dynatrace Query Language (DQL).  I claim no significant expertise: all outputs have been largely the result of experimentation (aka trial and error).
